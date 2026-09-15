@@ -1,7 +1,20 @@
 /**
  * Gmail channel — polls the Gmail inbox for new primary/unread mail and
- * routes it through the normal v2 inbound path; replies go out via the
- * Gmail API using cached thread metadata for In-Reply-To/References.
+ * routes it through the normal v2 inbound path; the agent's responses go
+ * back out via the Gmail API as notes-to-self, threaded into the original
+ * conversation with In-Reply-To/References.
+ *
+ * SAFETY: every deliver() call is addressed to the mailbox owner
+ * (this.userEmail), never to the original external sender. No tool has
+ * ever existed for the agent to deliberately reply to a third party — so
+ * without this, EVERY ordinary agent turn (even a plain "got it, here's a
+ * summary") becomes a real outgoing email to whoever last emailed in. That
+ * caused a real incident (2026-09-15): hours of auto-generated replies
+ * landing on newsletter senders, a talent-pool system, a lottery marketing
+ * address, mailer-daemon bounce notices (a self-sustaining bounce loop),
+ * and a live Hetzner support ticket. Do not change `To:` in deliver() to
+ * anything other than this.userEmail without a deliberate, explicit,
+ * agent-invoked "reply to sender" action gating it.
  *
  * Native adapter, host-side only (like cli.ts) — googleapis calls happen
  * in this process, not inside the agent container. OAuth credentials live
@@ -186,8 +199,17 @@ export class GmailChannel implements ChannelAdapter {
 
     const subject = meta.subject.startsWith('Re:') ? meta.subject : `Re: ${meta.subject}`;
 
+    // SAFETY: always self-addressed. This is the agent talking to the
+    // mailbox owner, not a deliberate reply to the original sender — no
+    // tool has ever existed for the agent to choose to email a third
+    // party, so every response must land only in the owner's own inbox
+    // (threaded into the same conversation for context). Addressing this
+    // to meta.sender was the root cause of #incident-2026-09-15: hours of
+    // auto-generated replies landing on newsletter senders, a talent-pool
+    // system, a lottery marketing address, and a live Hetzner support
+    // ticket — because every ordinary agent turn ends up here.
     const headers = [
-      `To: ${meta.sender}`,
+      `To: ${this.userEmail}`,
       `From: ${this.userEmail}`,
       `Subject: ${subject}`,
       `In-Reply-To: ${meta.messageId}`,
@@ -208,10 +230,10 @@ export class GmailChannel implements ChannelAdapter {
         userId: 'me',
         requestBody: { raw: encodedMessage, threadId },
       });
-      log.info('Gmail reply sent', { to: meta.sender, threadId });
+      log.info('Gmail note-to-self sent', { threadId });
       return res.data.id ?? undefined;
     } catch (err) {
-      log.error('Failed to send Gmail reply', { threadId, err });
+      log.error('Failed to send Gmail note-to-self', { threadId, err });
       return undefined;
     }
   }
