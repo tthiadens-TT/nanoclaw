@@ -1,20 +1,20 @@
 /**
  * Gmail channel — polls the Gmail inbox for new primary/unread mail and
- * routes it through the normal v2 inbound path; the agent's responses go
- * back out via the Gmail API as notes-to-self, threaded into the original
- * conversation with In-Reply-To/References.
+ * routes it through the normal v2 inbound path. Ingest-only: `deliver()` is
+ * a hard no-op and sends nothing, on purpose.
  *
- * SAFETY: every deliver() call is addressed to the mailbox owner
- * (this.userEmail), never to the original external sender. No tool has
- * ever existed for the agent to deliberately reply to a third party — so
- * without this, EVERY ordinary agent turn (even a plain "got it, here's a
- * summary") becomes a real outgoing email to whoever last emailed in. That
- * caused a real incident (2026-09-15): hours of auto-generated replies
- * landing on newsletter senders, a talent-pool system, a lottery marketing
- * address, mailer-daemon bounce notices (a self-sustaining bounce loop),
- * and a live Hetzner support ticket. Do not change `To:` in deliver() to
- * anything other than this.userEmail without a deliberate, explicit,
- * agent-invoked "reply to sender" action gating it.
+ * SAFETY: no automatic outbound send exists on this channel. #incident-2026-
+ * 09-15: deliver() used to email whoever last sent a message in (hours of
+ * auto-generated replies hit a newsletter, a talent-pool system, a lottery
+ * marketing address, GitHub, and a live Hetzner support ticket, plus a
+ * mailer-daemon bounce loop). A follow-up fix that self-addressed the same
+ * replies as "notes to the owner" was ALSO rejected by the user: an
+ * automatic summary email is still an unapproved send and still just adds
+ * inbox noise. The user's explicit rule: no message of any kind may go out
+ * automatically, on any channel, without their explicit approval or
+ * explicit instruction for that specific send. Do not add any send path
+ * back to this file without that approval design in place first — see
+ * `deliver()`'s own docstring.
  *
  * Native adapter, host-side only (like cli.ts) — googleapis calls happen
  * in this process, not inside the agent container. OAuth credentials live
@@ -29,15 +29,9 @@
  *
  * One shared platformId for the whole mailbox (the account's own address) —
  * every email becomes a message in a single ongoing conversation, tagged
- * with its sender/subject, same as the original NanoClaw v1 design. This is
- * a deliberate choice over "one platformId per Gmail thread": mentions are
- * declared 'never', so there is no auto-wire-on-first-contact flow here —
- * the operator wires this one conversation once via `ncl`, and every email
- * flows through it rather than spawning a fresh wiring prompt per thread
- * (which would be unworkable for a normal inbox). Replies target whichever
- * thread was most recently delivered (`lastThreadId`) — correct for the
- * common case of discussing the latest email, same ambiguity a human
- * assistant would have if you said "reply to that" after several emails.
+ * with its sender/subject, same as the original NanoClaw v1 design. Mentions
+ * are declared 'never', so there is no auto-wire-on-first-contact flow here
+ * — the operator wires this one conversation once via `ncl`.
  */
 import fs from 'fs';
 import os from 'os';
@@ -49,13 +43,6 @@ import { OAuth2Client } from 'google-auth-library';
 import { log } from '../log.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import type { ChannelAdapter, ChannelDefaults, ChannelSetup, OutboundMessage } from './adapter.js';
-
-interface ThreadMeta {
-  sender: string;
-  senderName: string;
-  subject: string;
-  messageId: string; // RFC 2822 Message-ID, for In-Reply-To/References
-}
 
 /**
  * Email is DM-shaped: every inbound message engages the wired agent
@@ -98,8 +85,6 @@ export class GmailChannel implements ChannelAdapter {
   private pollIntervalMs: number;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private processedIds = new Set<string>();
-  private threadMeta = new Map<string, ThreadMeta>();
-  private lastThreadId: string | null = null;
   private consecutiveErrors = 0;
   private userEmail = '';
 
@@ -176,66 +161,22 @@ export class GmailChannel implements ChannelAdapter {
     return this.gmail !== null;
   }
 
-  async deliver(_platformId: string, _threadId: string | null, message: OutboundMessage): Promise<string | undefined> {
-    if (!this.gmail) {
-      log.warn('Gmail not initialized, dropping reply');
-      return undefined;
-    }
-
-    if (!this.lastThreadId) {
-      log.warn('No email has been delivered yet, nothing to reply to');
-      return undefined;
-    }
-    const threadId = this.lastThreadId;
-
-    const meta = this.threadMeta.get(threadId);
-    if (!meta) {
-      log.warn('No thread metadata for reply, cannot send', { threadId });
-      return undefined;
-    }
-
-    const text = extractText(message);
-    if (text === null) return undefined;
-
-    const subject = meta.subject.startsWith('Re:') ? meta.subject : `Re: ${meta.subject}`;
-
-    // SAFETY: always self-addressed. This is the agent talking to the
-    // mailbox owner, not a deliberate reply to the original sender — no
-    // tool has ever existed for the agent to choose to email a third
-    // party, so every response must land only in the owner's own inbox
-    // (threaded into the same conversation for context). Addressing this
-    // to meta.sender was the root cause of #incident-2026-09-15: hours of
-    // auto-generated replies landing on newsletter senders, a talent-pool
-    // system, a lottery marketing address, and a live Hetzner support
-    // ticket — because every ordinary agent turn ends up here.
-    const headers = [
-      `To: ${this.userEmail}`,
-      `From: ${this.userEmail}`,
-      `Subject: ${subject}`,
-      `In-Reply-To: ${meta.messageId}`,
-      `References: ${meta.messageId}`,
-      'Content-Type: text/plain; charset=utf-8',
-      '',
-      text,
-    ].join('\r\n');
-
-    const encodedMessage = Buffer.from(headers)
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-
-    try {
-      const res = await this.gmail.users.messages.send({
-        userId: 'me',
-        requestBody: { raw: encodedMessage, threadId },
-      });
-      log.info('Gmail note-to-self sent', { threadId });
-      return res.data.id ?? undefined;
-    } catch (err) {
-      log.error('Failed to send Gmail note-to-self', { threadId, err });
-      return undefined;
-    }
+  /**
+   * SAFETY: hard no-op. Never sends anything — not to the original sender,
+   * not as a self-addressed note, not anywhere. #incident-2026-09-15: this
+   * used to reply to whoever last emailed in (hours of auto-generated
+   * replies hit a newsletter, a talent-pool system, a lottery marketing
+   * address, and a live Hetzner support ticket). The follow-up fix
+   * (self-addressed "notes") was ALSO rejected by the user — an automatic
+   * summary email is still an unapproved send and still just adds inbox
+   * noise. Per the user's explicit rule: no message of any kind may go out
+   * automatically, on any channel, without their explicit approval or
+   * explicit instruction for that specific send. Do not restore any send
+   * path here without that approval design in place first.
+   */
+  async deliver(_platformId: string, _threadId: string | null, _message: OutboundMessage): Promise<string | undefined> {
+    log.info('Gmail outbound send suppressed (sending is disabled pending an explicit approval mechanism)');
+    return undefined;
   }
 
   // --- Private ---
@@ -291,7 +232,6 @@ export class GmailChannel implements ChannelAdapter {
 
     const from = getHeader('From');
     const subject = getHeader('Subject');
-    const rfc2822MessageId = getHeader('Message-ID');
     const threadId = msg.data.threadId || messageId;
     const timestamp = new Date(parseInt(msg.data.internalDate || '0', 10)).toISOString();
 
@@ -307,16 +247,6 @@ export class GmailChannel implements ChannelAdapter {
       log.debug('Skipping email with no text body', { messageId, subject });
       return;
     }
-
-    // Keep metadata for every thread we've seen — deliver() replies into
-    // whichever one was most recently delivered (this.lastThreadId).
-    this.threadMeta.set(threadId, {
-      sender: senderEmail,
-      senderName,
-      subject,
-      messageId: rfc2822MessageId,
-    });
-    this.lastThreadId = threadId;
 
     const content = `[Email from ${senderName} <${senderEmail}>]\nSubject: ${subject}\n\n${body}`;
 
@@ -364,15 +294,6 @@ export class GmailChannel implements ChannelAdapter {
 
     return '';
   }
-}
-
-function extractText(message: OutboundMessage): string | null {
-  const content = message.content as Record<string, unknown> | string | undefined;
-  if (typeof content === 'string') return content;
-  if (content && typeof content === 'object' && typeof content.text === 'string') {
-    return content.text;
-  }
-  return null;
 }
 
 function createAdapter(): ChannelAdapter | null {

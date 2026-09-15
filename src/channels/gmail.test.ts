@@ -43,7 +43,10 @@ describe('GmailChannel', () => {
   });
 
   describe('deliver', () => {
-    it('no-ops when not connected', async () => {
+    // Hard no-op by design (#incident-2026-09-15): never sends anything,
+    // on any channel, without the user's explicit approval or instruction.
+    // See the module and deliver() docstrings before ever changing this.
+    it('never sends anything, regardless of connection state', async () => {
       const result = await channel.deliver('thread-1', null, { kind: 'chat', content: { text: 'hi' } });
       expect(result).toBeUndefined();
     });
